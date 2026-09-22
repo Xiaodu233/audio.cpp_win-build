@@ -1,0 +1,584 @@
+# audio.cpp - windows-release.yml
+#
+# Windows-only release builder for the x64 prebuilt packages.
+#
+# Scope: builds, bundles and (optionally) publishes ONLY the Windows assets of a
+# release, using the same asset names and layout as the multi-platform
+# `release.yml`:
+#
+#   audio-<tag>-bin-windows-x64-cpu.zip
+#   audio-<tag>-bin-windows-x64-cpu-portable.zip
+#   audio-<tag>-bin-windows-x64-vulkan.zip
+#   audio-<tag>-bin-windows-x64-cuda<XY>.zip
+#   audio-<tag>-cudart-windows-x64-cuda<XY>.zip
+#
+# Each zip is the flat contents of a build directory: audiocpp_*.exe (+ the
+# ggml-*.dll backend modules for the shared-library CUDA build), the app-local
+# MSVC/CRT/OpenMP runtime DLLs, LICENSE, tools/ and model_specs/.
+#
+# Differences from `release.yml`:
+#   * every variant is pinned to the newest toolchain that is currently known to
+#     build this tree (see the TOOLCHAIN table below);
+#   * CMake is invoked directly instead of through scripts\build_windows.ps1.
+#     The PowerShell script resolves CMake from the Visual Studio install first
+#     ($VSINSTALL\Common7\IDE\CommonExtensions\Microsoft\CMake\...), which pins
+#     the build to whatever SDK version ships inside the VS image. Calling CMake
+#     explicitly lets the workflow use the pinned CMake/Ninja below and keeps
+#     the CUDA path (which already bypasses the script) and the CPU/Vulkan paths
+#     identical. The flag set mirrors Get-PresetSettings/Get-CpuArchSettings in
+#     scripts\build_windows.ps1 - if that script changes, mirror it here too.
+#
+# TOOLCHAIN (verified 2026-09-22):
+#   runner           windows-2025 (VS 2022 Enterprise 17.14, MSVC x64, SDK 26100)
+#   CMake            4.4.3   (latest; tree builds cleanly: every vendored
+#                            cmake_minimum_required is >= 3.5, so the CMake 4
+#                            "< 3.5 removed" cut-off does not apply. If a future
+#                            submodule drops below 3.5, drop CMAKE_VERSION to
+#                            3.31.12 (last 3.x) or pass
+#                            -DCMAKE_POLICY_VERSION_MINIMUM=3.5.)
+#   Ninja            1.13.2
+#   Vulkan SDK       1.4.357.0 (LunarG "latest for Windows")
+#   CUDA             12.9.2 (last 12.x lane) + 13.3.1
+#                    13.4.x is NOT usable yet: Jimver/cuda-toolkit@v0.2.36 ships
+#                    a static Windows link table and stops at 13.3.1. Bump CUDA
+#                    13 lane to 13.4.x only after that action publishes a newer
+#                    table, otherwise the install step fails to resolve a URL.
+#
+# Concurrency: this workflow shares the `release` group with `release.yml`, so a
+# tag that triggers both workflows serialises them. Whichever finishes first
+# creates the Release; the other detects it and uploads with --clobber.
+
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to build, e.g. 1.2.0 or v1.2.0 (manual runs; tag-triggered runs use the pushed tag).'
+        required: true
+        default: ''
+        type: string
+      publish:
+        description: 'Attach the built zips to the GitHub Release and create it if missing. Leave unchecked for a build-only dry run.'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  BUILD_TARGETS: audiocpp_cli audiocpp_server audiocpp_gguf
+  CMAKE_VERSION: '4.4.3'
+  NINJA_VERSION: '1.13.2'
+  VULKAN_VERSION: '1.4.357.0'
+
+concurrency:
+  group: release
+  queue: max
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve release tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            TAG="${{ inputs.version }}"
+          else
+            echo "::error::No semver tag or version provided (push a v* tag, or run manually with a version)."
+            exit 1
+          fi
+          [[ "$TAG" == v* ]] || TAG="v${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  # CPU (preset default), CPU portable (baseline arch, llamafile SGEMM off) and
+  # Vulkan. Three variants share one job: identical construction, differing only
+  # in a handful of cache variables.
+  windows:
+    name: 'Windows x64 (${{ matrix.asset }})'
+    needs: get-version
+    runs-on: windows-2025
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: cpu
+            enable_vulkan: 'OFF'
+            # Mirrors Get-PresetSettings('windows-cpu-release'): native CPU
+            # tuning + llamafile SGEMM, no explicit GGML_AVX* overrides.
+            extra_cmake: ''
+            needs_vulkan: false
+          - asset: cpu-portable
+            enable_vulkan: 'OFF'
+            # Mirrors Get-CpuArchSettings('baseline') + -Llamafile OFF: broadest
+            # compatibility, no AVX/AVX2/AVX512 feature selection.
+            extra_cmake: >-
+              -DENGINE_ENABLE_NATIVE_CPU=OFF
+              -DENGINE_ENABLE_LLAMAFILE=OFF
+              -DGGML_AVX=OFF
+              -DGGML_AVX2=OFF
+              -DGGML_AVX512=OFF
+              -DGGML_AVX512_VBMI=OFF
+              -DGGML_AVX512_VNNI=OFF
+              -DGGML_AVX512_BF16=OFF
+              -DGGML_AVX_VNNI=OFF
+            needs_vulkan: false
+          - asset: vulkan
+            enable_vulkan: 'ON'
+            extra_cmake: ''
+            needs_vulkan: true
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }} and Ninja ${{ env.NINJA_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'tools'
+          $cmakeDir = Join-Path $tools "cmake-${{ env.CMAKE_VERSION }}-windows-x86_64"
+          $ninjaDir = Join-Path $tools 'ninja'
+          New-Item -ItemType Directory -Force -Path $tools, $ninjaDir | Out-Null
+
+          $cmakeZip = Join-Path $tools 'cmake.zip'
+          curl.exe -L --fail-with-body -o $cmakeZip `
+            "https://github.com/Kitware/CMake/releases/download/v${{ env.CMAKE_VERSION }}/cmake-${{ env.CMAKE_VERSION }}-windows-x86_64.zip"
+          Expand-Archive -LiteralPath $cmakeZip -DestinationPath $tools -Force
+
+          $ninjaZip = Join-Path $tools 'ninja.zip'
+          curl.exe -L --fail-with-body -o $ninjaZip `
+            "https://github.com/ninja-build/ninja/releases/download/v${{ env.NINJA_VERSION }}/ninja-win.zip"
+          Expand-Archive -LiteralPath $ninjaZip -DestinationPath $ninjaDir -Force
+
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $cmakeDir 'bin')
+          Add-Content -Path $env:GITHUB_PATH -Value $ninjaDir
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Vulkan SDK ${{ env.VULKAN_VERSION }}
+        if: ${{ matrix.needs_vulkan }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          curl.exe -L --fail-with-body -o $installer `
+            "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_VERSION }}/windows/vulkansdk-windows-X64-${{ env.VULKAN_VERSION }}.exe"
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer failed with exit code $LASTEXITCODE" }
+          $sdk = "C:\\VulkanSDK\\${{ env.VULKAN_VERSION }}"
+          if (-not (Test-Path (Join-Path $sdk 'bin\glslc.exe'))) {
+            throw "Vulkan SDK was not installed where expected: $sdk"
+          }
+          # ggml-vulkan locates the SDK through VULKAN_SDK and shells out to
+          # glslc when compiling its shaders, so it must sit on PATH too.
+          Add-Content -Path $env:GITHUB_ENV  -Value "VULKAN_SDK=$sdk"
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $sdk 'Bin')
+
+      - name: Configure
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = @(
+            '-S', '.',
+            '-B', "build/${{ matrix.asset }}",
+            '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            '-DCMAKE_C_FLAGS=/utf-8',
+            '-DCMAKE_CXX_FLAGS=/utf-8 /EHsc',
+            '-DENGINE_ENABLE_CUDA=OFF',
+            '-DENGINE_ENABLE_CUDA_GRAPHS=OFF',
+            '-DENGINE_ENABLE_VULKAN=${{ matrix.enable_vulkan }}',
+            '-DENGINE_ENABLE_METAL=OFF',
+            '-DENGINE_ENABLE_OPENMP=ON',
+            '-DGGML_OPENMP=ON',
+            '-DOpenMP_C_FLAGS=/openmp:experimental',
+            '-DOpenMP_CXX_FLAGS=/openmp:experimental',
+            '-DENGINE_ENABLE_NATIVE_CPU=ON',
+            '-DENGINE_ENABLE_LLAMAFILE=ON',
+            '-DENGINE_BUILD_TESTS=OFF',
+            '-DAUDIOCPP_DEPLOYMENT_BUILD=ON',
+            '-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON',
+            '-DAUDIOCPP_USE_SYSTEM_OPENSSL=OFF',
+            '-DAUDIOCPP_VERSION=${{ needs.get-version.outputs.version }}'
+          )
+          $extra = '${{ matrix.extra_cmake }}'.Trim()
+          if ($extra) { $args += ($extra -split '\s+') }
+
+          Write-Host ('> cmake ' + ($args -join ' '))
+          cmake @args
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+          Select-String -Path "build/${{ matrix.asset }}/CMakeCache.txt" -Pattern '^(GGML_OPENMP_ENABLED|AUDIOCPP_VERSION|ENGINE_ENABLE_VULKAN):'
+
+      - name: Build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targets = "$env:BUILD_TARGETS".Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          cmake --build "build/${{ matrix.asset }}" --config Release -j $env:NUMBER_OF_PROCESSORS --target $targets
+          if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+
+      - name: Smoke test binaries
+        working-directory: build/${{ matrix.asset }}/bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($exe in Get-ChildItem -Path . -Filter 'audiocpp_*.exe') {
+            & $exe.FullName --version
+            if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) --version exited with $LASTEXITCODE" }
+          }
+
+      - name: Bundle VC runtime
+        working-directory: build/${{ matrix.asset }}/bin
+        # App-local deployment of the MSVC runtime (+ OpenMP) so the prebuilt
+        # binaries run on a clean Windows without the VC++ Redistributable.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found; cannot locate the VC redist files' }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+            Select-Object -First 1
+          Write-Host "Redist dir: $($redist.FullName)"
+          foreach ($sub in 'x64\Microsoft.VC143.CRT', 'x64\Microsoft.VC143.OPENMP') {
+            $dir = Join-Path $redist.FullName $sub
+            if (Test-Path $dir) {
+              Get-ChildItem "$dir\*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140|vcomp140)' } |
+                Copy-Item -Destination . -Force
+            } else {
+              Write-Host "::warning::Missing redist directory: $dir"
+            }
+          }
+          Get-ChildItem *.dll | Select-Object -ExpandProperty Name
+
+      - name: Stage bundle
+        working-directory: build/${{ matrix.asset }}/bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item ..\..\..\LICENSE . -Force
+          if (Test-Path ..\..\..\tools)       { Copy-Item -Recurse ..\..\..\tools       .\tools -Force }
+          if (Test-Path ..\..\..\model_specs) { Copy-Item -Recurse ..\..\..\model_specs .\model_specs -Force }
+          Get-ChildItem | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Package zip
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip  = "dist/audio-${{ needs.get-version.outputs.tag }}-bin-windows-x64-${{ matrix.asset }}.zip"
+          Compress-Archive -Path "build/${{ matrix.asset }}/bin/*" -DestinationPath $zip -CompressionLevel Optimal
+          $info = Get-Item $zip
+          Write-Host ("{0}  {1} MB" -f $info.Name, [math]::Round($info.Length / 1MB, 2))
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          $hash | Out-File -FilePath "$zip.sha256" -Encoding utf8
+          @(
+            "### ${{ matrix.asset }}"
+            ""
+            "- zip: $($info.Name) ($($info.Length) bytes)"
+            "- sha256: ``$hash``"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v7
+        with:
+          # Artifact name == final asset basename, same convention as release.yml.
+          name: audio-${{ needs.get-version.outputs.tag }}-bin-windows-x64-${{ matrix.asset }}
+          path: dist/audio-${{ needs.get-version.outputs.tag }}-bin-windows-x64-${{ matrix.asset }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # CUDA lane. Uses the GGML_BACKEND_DL model (ENGINE_ENABLE_CPU_ALL_VARIANTS
+  # flips BUILD_SHARED_LIBS + GGML_BACKEND_DL in audio.cpp/CMakeLists.txt) so the
+  # CUDA backend is compiled once as ggml-cuda.dll and cli/server/gguf stay thin
+  # shells; the heavy CUDA runtime DLLs ship separately in the cudart zip.
+  windows-cuda:
+    name: 'Windows x64 (CUDA ${{ matrix.label }})'
+    needs: get-version
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Two lanes: newest 12.x (older NVIDIA drivers) and newest 13.x.
+          # sm_120 (RTX 50 series) is CUDA 12.8+, sm_121 is CUDA 12.9+.
+          - cuda: '12.9.2'
+            label: '12.9'
+            cuda_archs: '70;75;80;86;89;90;120'
+          - cuda: '13.3.1'
+            label: '13.3'
+            cuda_archs: '75;80;86;89;90;120;121'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: 'local'
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }} and Ninja ${{ env.NINJA_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'tools'
+          $cmakeDir = Join-Path $tools "cmake-${{ env.CMAKE_VERSION }}-windows-x86_64"
+          $ninjaDir = Join-Path $tools 'ninja'
+          New-Item -ItemType Directory -Force -Path $tools, $ninjaDir | Out-Null
+
+          $cmakeZip = Join-Path $tools 'cmake.zip'
+          curl.exe -L --fail-with-body -o $cmakeZip `
+            "https://github.com/Kitware/CMake/releases/download/v${{ env.CMAKE_VERSION }}/cmake-${{ env.CMAKE_VERSION }}-windows-x86_64.zip"
+          Expand-Archive -LiteralPath $cmakeZip -DestinationPath $tools -Force
+
+          $ninjaZip = Join-Path $tools 'ninja.zip'
+          curl.exe -L --fail-with-body -o $ninjaZip `
+            "https://github.com/ninja-build/ninja/releases/download/v${{ env.NINJA_VERSION }}/ninja-win.zip"
+          Expand-Archive -LiteralPath $ninjaZip -DestinationPath $ninjaDir -Force
+
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $cmakeDir 'bin')
+          Add-Content -Path $env:GITHUB_PATH -Value $ninjaDir
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Show toolchain
+        run: |
+          cl /? 2>&1 | Select-Object -First 1
+          nvcc --version
+          cmake --version | Select-Object -First 1
+          ninja --version
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+
+      - name: Configure
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # OpenMP off: matches llama.cpp's CUDA path and the CUDA job in
+          # release.yml. CMAKE_CUDA_ARCHITECTURES must be pinned - audio.cpp
+          # otherwise defaults to "native", i.e. the build host GPU, which is
+          # meaningless on GPU-less CI runners and produces an unreliable fatbin.
+          $args = @(
+            '-S', '.',
+            '-B', "build/cuda${{ matrix.label }}",
+            '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            '-DCMAKE_C_FLAGS=/utf-8',
+            '-DCMAKE_CXX_FLAGS=/utf-8 /EHsc',
+            '-DENGINE_ENABLE_CUDA=ON',
+            '-DENGINE_ENABLE_CUDA_GRAPHS=ON',
+            '-DENGINE_ENABLE_OPENMP=OFF',
+            '-DGGML_OPENMP=OFF',
+            '-DENGINE_ENABLE_VULKAN=OFF',
+            '-DENGINE_ENABLE_METAL=OFF',
+            '-DENGINE_ENABLE_NATIVE_CPU=ON',
+            '-DENGINE_ENABLE_LLAMAFILE=ON',
+            '-DENGINE_BUILD_TESTS=OFF',
+            '-DENGINE_ENABLE_CPU_ALL_VARIANTS=ON',
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}",
+            '-DCMAKE_CUDA_HOST_COMPILER=' + ((Get-Command cl.exe).Source -replace '\\', '/'),
+            '-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8',
+            '-DCUDAToolkit_ROOT=' + ($env:CUDA_PATH -replace '\\', '/'),
+            '-DAUDIOCPP_DEPLOYMENT_BUILD=ON',
+            '-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON',
+            '-DAUDIOCPP_VERSION=${{ needs.get-version.outputs.version }}'
+          )
+          Write-Host ('> cmake ' + ($args -join ' '))
+          cmake @args
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+          Select-String -Path "build/cuda${{ matrix.label }}/CMakeCache.txt" -Pattern '^(AUDIOCPP_VERSION|CMAKE_CUDA_ARCHITECTURES|GGML_BACKEND_DL):'
+
+      - name: Build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targets = "$env:BUILD_TARGETS".Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          cmake --build "build/cuda${{ matrix.label }}" --config Release -j $env:NUMBER_OF_PROCESSORS --target $targets
+          if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+
+      - name: Bundle CUDA runtime
+        # cudart/cublas/cublasLt/cufft are what engine_runtime links against
+        # (CUDA::cublas and CUDA::cufft in CMakeLists.txt for the inverse-STFT
+        # kernel). Staged outside build/bin so the thin bin artifact stays free
+        # of the runtime DLLs - they ship as their own download.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dst = "build\cudart"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $dlls = 'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'cufft64_*.dll'
+          foreach ($src in "$env:CUDA_PATH\bin", "$env:CUDA_PATH\lib", "$env:CUDA_PATH\bin\x64") {
+            if (Test-Path $src) {
+              $null = robocopy $src $dst $dlls /NFL /NDL /NJH /NJS
+              # robocopy exit codes 0-7 are success variants; anything >=8 is an
+              # error, except the missing-source-directory case we already guarded.
+            }
+          }
+          if (-not (Get-ChildItem -Path $dst -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) {
+            throw "CUDA runtime DLLs were not found under $env:CUDA_PATH"
+          }
+          Get-ChildItem $dst -Filter *.dll | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Bundle VC runtime
+        working-directory: build/cuda${{ matrix.label }}/bin
+        # The CUDA configuration disables OpenMP, so only the /MD CRT is needed.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found; cannot locate the VC redist files' }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+            Select-Object -First 1
+          $dir = Join-Path $redist.FullName 'x64\Microsoft.VC143.CRT'
+          if (Test-Path $dir) {
+            Get-ChildItem "$dir\*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } |
+              Copy-Item -Destination . -Force
+          } else {
+            Write-Host "::warning::Missing redist directory: $dir"
+          }
+          Get-ChildItem *.dll | Select-Object -ExpandProperty Name
+
+      - name: Stage bundle
+        working-directory: build/cuda${{ matrix.label }}/bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item ..\..\LICENSE . -Force
+          if (Test-Path ..\..\tools)       { Copy-Item -Recurse ..\..\tools       .\tools -Force }
+          if (Test-Path ..\..\model_specs) { Copy-Item -Recurse ..\..\model_specs .\model_specs -Force }
+          Get-ChildItem | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Package zips
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $tag = '${{ needs.get-version.outputs.tag }}'
+          $bin    = "dist/audio-$tag-bin-windows-x64-cuda${{ matrix.label }}.zip"
+          $cudart = "dist/audio-$tag-cudart-windows-x64-cuda${{ matrix.label }}.zip"
+          Compress-Archive -Path "build/cuda${{ matrix.label }}/bin/*" -DestinationPath $bin    -CompressionLevel Optimal
+          Compress-Archive -Path "build/cudart/*"                      -DestinationPath $cudart -CompressionLevel Optimal
+          $summary = @("### cuda${{ matrix.label }}", "")
+          foreach ($z in $bin, $cudart) {
+            $info  = Get-Item $z
+            $hash  = (Get-FileHash $z -Algorithm SHA256).Hash
+            $hash | Out-File -FilePath "$z.sha256" -Encoding utf8
+            Write-Host ("{0}  {1} MB" -f $info.Name, [math]::Round($info.Length / 1MB, 2))
+            $summary += "- $($info.Name) ($($info.Length) bytes) sha256: ``$hash``"
+          }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-${{ needs.get-version.outputs.tag }}-bin-windows-x64-cuda${{ matrix.label }}
+          path: dist/audio-${{ needs.get-version.outputs.tag }}-bin-windows-x64-cuda${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-${{ needs.get-version.outputs.tag }}-cudart-windows-x64-cuda${{ matrix.label }}
+          path: dist/audio-${{ needs.get-version.outputs.tag }}-cudart-windows-x64-cuda${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish Windows assets
+    needs: [get-version, windows, windows-cuda]
+    # Publish only for an intentional trigger: a pushed v* tag, or a manual run
+    # with publish checked. Everything else just leaves the zips on the run.
+    if: >-
+      ${{
+        always() &&
+        needs.get-version.result == 'success' &&
+        needs.windows.result == 'success' &&
+        needs.windows-cuda.result == 'success' &&
+        (github.ref_type == 'tag' || inputs.publish)
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          pattern: audio-${{ needs.get-version.outputs.tag }}-*-windows-x64-*
+
+      - name: Collect and hash assets
+        run: |
+          set -euo pipefail
+          # Each artifact is a directory holding one zip; flatten them so the
+          # upload glob below matches real files.
+          mkdir -p dist
+          find assets -type f -name '*.zip' -exec mv {} dist/ \;
+          rm -rf assets
+          ls -la dist
+          cd dist
+          sha256sum *.zip | tee SHA256SUMS.txt
+          {
+            echo "## Windows assets for ${{ needs.get-version.outputs.tag }}"
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create and push git tag
+        # Tag-triggered runs already have it; manual runs may not.
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.get-version.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists, skipping creation"
+          else
+            git tag "${TAG}"
+            git push origin "${TAG}"
+          fi
+
+      - name: Check for existing release
+        id: relstate
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload binaries to existing release
+        if: ${{ steps.relstate.outputs.exists == 'true' }}
+        # --clobber replaces same-named assets only; the other platforms'
+        # assets that release.yml attached stay untouched.
+        run: |
+          gh release upload "${{ needs.get-version.outputs.tag }}" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Create release
+        if: ${{ steps.relstate.outputs.exists != 'true' }}
+        run: |
+          gh release create "${{ needs.get-version.outputs.tag }}" dist/*.zip \
+            --title "${{ needs.get-version.outputs.tag }}" \
+            --generate-notes --repo "$GITHUB_REPOSITORY"
