@@ -28,8 +28,11 @@
 #     identical. The flag set mirrors Get-PresetSettings/Get-CpuArchSettings in
 #     scripts\build_windows.ps1 - if that script changes, mirror it here too.
 #
-# TOOLCHAIN (verified 2026-09-22):
-#   runner           windows-2025 (VS 2022 Enterprise 17.14, MSVC x64, SDK 26100)
+# TOOLCHAIN (verified 2026-09-22, re-verified against a real run of this file):
+#   runner           windows-2025 NOW MAPS TO THE VS 2026 IMAGE
+#                    (C:\Program Files\Microsoft Visual Studio\18\Enterprise,
+#                    MSVC 19.51 / _MSC_VER 1951). CPU and Vulkan build fine on
+#                    it. windows-2022 still ships VS 2022 17.14 (MSVC 19.4x).
 #   CMake            4.4.3   (latest; tree builds cleanly: every vendored
 #                            cmake_minimum_required is >= 3.5, so the CMake 4
 #                            "< 3.5 removed" cut-off does not apply. If a future
@@ -38,11 +41,22 @@
 #                            -DCMAKE_POLICY_VERSION_MINIMUM=3.5.)
 #   Ninja            1.13.2
 #   Vulkan SDK       1.4.357.0 (LunarG "latest for Windows")
-#   CUDA             12.9.2 (last 12.x lane) + 13.3.1
+#   CUDA             12.9.2 on windows-2022 + 13.3.1 on windows-2025.
+#                    nvcc whitelists host compilers: MSVC 195x (VS 2026) is only
+#                    accepted from CUDA 13.2 onwards, so the 12.x lane has to
+#                    build on the VS 2022 image. Do not move 12.x to
+#                    windows-2025 - it fails with "unsupported Microsoft Visual
+#                    Studio version".
 #                    13.4.x is NOT usable yet: Jimver/cuda-toolkit@v0.2.36 ships
 #                    a static Windows link table and stops at 13.3.1. Bump CUDA
 #                    13 lane to 13.4.x only after that action publishes a newer
 #                    table, otherwise the install step fails to resolve a URL.
+#
+# Windows/PowerShell gotcha that cost a run: values containing spaces (every
+# "C:\Program Files\..." path) are split when PowerShell marshals native
+# arguments, so -DCUDAToolkit_ROOT=<CUDA_PATH> arrived at cmake as an empty
+# value plus a stray positional path. Never pass a Program Files path as a CMake
+# -D value from pwsh; this file routes it through the C:\cuda junction instead.
 #
 # Concurrency: this workflow shares the `release` group with `release.yml`, so a
 # tag that triggers both workflows serialises them. Whichever finishes first
@@ -237,11 +251,20 @@ jobs:
 
       - name: Smoke test binaries
         working-directory: build/${{ matrix.asset }}/bin
+        # Only the CLI and the server implement --version (app/cli/main.cpp,
+        # app/server/main.cpp). audiocpp_gguf has no --version flag - it exits 1
+        # on unknown arguments - so it is probed with --help instead
+        # (app/gguf/main.cpp: print_usage(); return 0;).
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($exe in Get-ChildItem -Path . -Filter 'audiocpp_*.exe') {
-            & $exe.FullName --version
-            if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) --version exited with $LASTEXITCODE" }
+          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
+            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
+            & ".\$name" --version
+            if ($LASTEXITCODE -ne 0) { throw "$name --version exited with $LASTEXITCODE" }
+          }
+          if (Test-Path 'audiocpp_gguf.exe') {
+            & .\audiocpp_gguf.exe --help
+            if ($LASTEXITCODE -ne 0) { throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE" }
           }
 
       - name: Bundle VC runtime
@@ -275,7 +298,13 @@ jobs:
           Copy-Item ..\..\..\LICENSE . -Force
           if (Test-Path ..\..\..\tools)       { Copy-Item -Recurse ..\..\..\tools       .\tools -Force }
           if (Test-Path ..\..\..\model_specs) { Copy-Item -Recurse ..\..\..\model_specs .\model_specs -Force }
-          Get-ChildItem | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          # Inventory goes to the job summary so the packaged dependency set can
+          # be checked without downloading the zip.
+          $entries = Get-ChildItem -Force | Sort-Object Name
+          $entries | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          @("**package contents - ${{ matrix.asset }} (top level)**", '') +
+            ($entries | ForEach-Object { "- $($_.Name)" }) |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Package zip
         run: |
@@ -309,7 +338,7 @@ jobs:
   windows-cuda:
     name: 'Windows x64 (CUDA ${{ matrix.label }})'
     needs: get-version
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 360
     defaults:
       run:
@@ -320,12 +349,20 @@ jobs:
         include:
           # Two lanes: newest 12.x (older NVIDIA drivers) and newest 13.x.
           # sm_120 (RTX 50 series) is CUDA 12.8+, sm_121 is CUDA 12.9+.
+          #
+          # Runner selection is driven by nvcc's host-compiler whitelist:
+          # windows-2025 is now the VS 2026 image (MSVC 19.51 / _MSC_VER 1951),
+          # which CUDA only accepts from 13.2 onwards. The 12.9 lane therefore
+          # builds on windows-2022 (VS 2022 17.14, MSVC 19.4x), which every
+          # supported 12.x toolkit accepts.
           - cuda: '12.9.2'
             label: '12.9'
             cuda_archs: '70;75;80;86;89;90;120'
+            runs_on: windows-2022
           - cuda: '13.3.1'
             label: '13.3'
             cuda_archs: '75;80;86;89;90;120;121'
+            runs_on: windows-2025
 
     steps:
       - uses: actions/checkout@v7
@@ -379,6 +416,19 @@ jobs:
           # release.yml. CMAKE_CUDA_ARCHITECTURES must be pinned - audio.cpp
           # otherwise defaults to "native", i.e. the build host GPU, which is
           # meaningless on GPU-less CI runners and produces an unreliable fatbin.
+          if (-not $env:CUDA_PATH) { throw 'CUDA_PATH was not exported by the toolkit install step' }
+          # C:\Program Files\... contains spaces, and PowerShell's native-argument
+          # marshalling splits them: the previous run produced an empty
+          # CUDAToolkit_ROOT plus a stray "Ignoring extra path from command line"
+          # warning, and FindCUDAToolkit then failed with "Could not find nvcc".
+          # Repoint through a space-free junction instead. If the junction cannot
+          # be created, fall back to FindCUDAToolkit's CUDA_PATH/PATH search.
+          $cudaRoot = 'C:/cuda'
+          if (-not (Test-Path 'C:\cuda')) {
+            try { New-Item -ItemType Junction -Path 'C:\cuda' -Target $env:CUDA_PATH -ErrorAction Stop | Out-Null }
+            catch { Write-Host "::warning::Could not create C:\cuda junction: $($_.Exception.Message)" }
+          }
+
           $args = @(
             '-S', '.',
             '-B', "build/cuda${{ matrix.label }}",
@@ -397,13 +447,20 @@ jobs:
             '-DENGINE_BUILD_TESTS=OFF',
             '-DENGINE_ENABLE_CPU_ALL_VARIANTS=ON',
             "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}",
-            '-DCMAKE_CUDA_HOST_COMPILER=' + ((Get-Command cl.exe).Source -replace '\\', '/'),
+            # No -DCMAKE_CUDA_HOST_COMPILER: the cl.exe path lives under
+            # "C:\Program Files\Microsoft Visual Studio\..." and gets split the
+            # same way. CMake already uses CMAKE_CXX_COMPILER (cl.exe from the
+            # msvc-dev-cmd environment) as the nvcc host compiler.
             '-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8',
-            '-DCUDAToolkit_ROOT=' + ($env:CUDA_PATH -replace '\\', '/'),
             '-DAUDIOCPP_DEPLOYMENT_BUILD=ON',
             '-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON',
             '-DAUDIOCPP_VERSION=${{ needs.get-version.outputs.version }}'
           )
+          if (Test-Path "$cudaRoot/bin/nvcc.exe") {
+            $args += "-DCUDAToolkit_ROOT=$cudaRoot"
+          } else {
+            Write-Host '::warning::C:\cuda junction is unusable; falling back to CUDA_PATH/PATH for nvcc'
+          }
           Write-Host ('> cmake ' + ($args -join ' '))
           cmake @args
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
@@ -415,6 +472,24 @@ jobs:
           $targets = "$env:BUILD_TARGETS".Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
           cmake --build "build/cuda${{ matrix.label }}" --config Release -j $env:NUMBER_OF_PROCESSORS --target $targets
           if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+
+      - name: Smoke test binaries
+        working-directory: build/cuda${{ matrix.label }}/bin
+        # Backends are dlopen-ed (GGML_BACKEND_DL), so --version never touches a
+        # GPU; it does prove the thin shells + ggml-*.dll layout loads. The
+        # toolkit's own bin dir is on PATH here, so cudart resolves if it is
+        # needed at all.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
+            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
+            & ".\$name" --version
+            if ($LASTEXITCODE -ne 0) { throw "$name --version exited with $LASTEXITCODE" }
+          }
+          if (Test-Path 'audiocpp_gguf.exe') {
+            & .\audiocpp_gguf.exe --help
+            if ($LASTEXITCODE -ne 0) { throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE" }
+          }
 
       - name: Bundle CUDA runtime
         # cudart/cublas/cublasLt/cufft are what engine_runtime links against
@@ -465,7 +540,14 @@ jobs:
           Copy-Item ..\..\LICENSE . -Force
           if (Test-Path ..\..\tools)       { Copy-Item -Recurse ..\..\tools       .\tools -Force }
           if (Test-Path ..\..\model_specs) { Copy-Item -Recurse ..\..\model_specs .\model_specs -Force }
-          Get-ChildItem | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          # Inventory goes to the job summary so the packaged dependency set can
+          # be checked without downloading the zip. ggml-*.dll must be here:
+          # CPU_ALL_VARIANTS makes the backends shared libraries.
+          $entries = Get-ChildItem -Force | Sort-Object Name
+          $entries | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          @("**package contents - cuda${{ matrix.label }} bin (top level)**", '') +
+            ($entries | ForEach-Object { "- $($_.Name)" }) |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Package zips
         run: |
