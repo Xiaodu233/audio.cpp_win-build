@@ -262,24 +262,6 @@ jobs:
           cmake --build "build/${{ matrix.asset }}" --config Release -j $env:NUMBER_OF_PROCESSORS --target $targets
           if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
 
-      - name: Smoke test binaries
-        working-directory: build/${{ matrix.asset }}/bin
-        # Only the CLI and the server implement --version (app/cli/main.cpp,
-        # app/server/main.cpp). audiocpp_gguf has no --version flag - it exits 1
-        # on unknown arguments - so it is probed with --help instead
-        # (app/gguf/main.cpp: print_usage(); return 0;).
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
-            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
-            & ".\$name" --version
-            if ($LASTEXITCODE -ne 0) { throw "$name --version exited with $LASTEXITCODE" }
-          }
-          if (Test-Path 'audiocpp_gguf.exe') {
-            & .\audiocpp_gguf.exe --help
-            if ($LASTEXITCODE -ne 0) { throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE" }
-          }
-
       - name: Bundle VC runtime
         working-directory: build/${{ matrix.asset }}/bin
         # App-local deployment of the MSVC runtime (+ OpenMP) so the prebuilt
@@ -321,7 +303,7 @@ jobs:
 
           # Cross-check against the real PE imports so a missing runtime can
           # never be packaged silently again.
-          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
           if (-not $dumpbin) {
             Write-Host '::warning::dumpbin.exe is not on PATH; skipping import verification'
           } else {
@@ -346,6 +328,52 @@ jobs:
               Where-Object { -not (Test-Path $_) })
             if ($missing.Count -gt 0) {
               throw "Runtime DLLs imported by the binaries are missing from the package: $($missing -join ', ')"
+            }
+          }
+
+      - name: Smoke test binaries
+        working-directory: build/${{ matrix.asset }}/bin
+        # Runs after the VC runtime is bundled, so it exercises exactly the file
+        # set that gets zipped. Only the CLI and the server implement --version
+        # (app/cli/main.cpp, app/server/main.cpp); audiocpp_gguf has no
+        # --version flag and is probed with --help instead
+        # (app/gguf/main.cpp: print_usage(); return 0;).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-UnresolvedImports {
+            param([string]$ExeName)
+            $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+            if (-not $dumpbin) { return @('<dumpbin.exe not on PATH>') }
+            $inDeps = $false
+            $unresolved = @()
+            foreach ($line in (& $dumpbin /dependents $ExeName 2>$null)) {
+              if ($line -match 'following dependencies') { $inDeps = $true; continue }
+              if (-not $inDeps) { continue }
+              if ($line.Trim() -eq '') { continue }
+              if ($line -notmatch '^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') { $inDeps = $false; continue }
+              $dll = $Matches[1]
+              if (Test-Path $dll) { continue }
+              $onPath = $false
+              foreach ($dir in $env:PATH.Split(';')) {
+                if ($dir -and (Test-Path (Join-Path $dir $dll))) { $onPath = $true; break }
+              }
+              if (-not $onPath) { $unresolved += $dll }
+            }
+            return $unresolved
+          }
+          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
+            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
+            & ".\$name" --version
+            if ($LASTEXITCODE -ne 0) {
+              $hex = '0x{0:X8}' -f ($LASTEXITCODE -band 0xFFFFFFFF)
+              throw "$name --version exited with $LASTEXITCODE ($hex); unresolved imports: $((Get-UnresolvedImports $name) -join ', ')"
+            }
+          }
+          if (Test-Path 'audiocpp_gguf.exe') {
+            & .\audiocpp_gguf.exe --help
+            if ($LASTEXITCODE -ne 0) {
+              $hex = '0x{0:X8}' -f ($LASTEXITCODE -band 0xFFFFFFFF)
+              throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE ($hex); unresolved imports: $((Get-UnresolvedImports 'audiocpp_gguf.exe') -join ', ')"
             }
           }
 
@@ -531,24 +559,6 @@ jobs:
           cmake --build "build/cuda${{ matrix.label }}" --config Release -j $env:NUMBER_OF_PROCESSORS --target $targets
           if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
 
-      - name: Smoke test binaries
-        working-directory: build/cuda${{ matrix.label }}/bin
-        # Backends are dlopen-ed (GGML_BACKEND_DL), so --version never touches a
-        # GPU; it does prove the thin shells + ggml-*.dll layout loads. The
-        # toolkit's own bin dir is on PATH here, so cudart resolves if it is
-        # needed at all.
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
-            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
-            & ".\$name" --version
-            if ($LASTEXITCODE -ne 0) { throw "$name --version exited with $LASTEXITCODE" }
-          }
-          if (Test-Path 'audiocpp_gguf.exe') {
-            & .\audiocpp_gguf.exe --help
-            if ($LASTEXITCODE -ne 0) { throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE" }
-          }
-
       - name: Bundle CUDA runtime
         # cudart/cublas/cublasLt/cufft are what engine_runtime links against
         # (CUDA::cublas and CUDA::cufft in CMakeLists.txt for the inverse-STFT
@@ -556,20 +566,31 @@ jobs:
         # of the runtime DLLs - they ship as their own download.
         run: |
           $ErrorActionPreference = 'Stop'
+          # robocopy reports SUCCESS with exit codes 0-7 (1 = files copied).
+          # PowerShell 7.3+ turns a non-zero native exit into a terminating error
+          # under $ErrorActionPreference='Stop', and GitHub additionally fails a
+          # pwsh step on a non-zero $LASTEXITCODE - both make a perfectly good
+          # robocopy run look like a failure. Opt out, then check the codes
+          # ourselves.
+          if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
           $dst = "build\cudart"
           New-Item -ItemType Directory -Force -Path $dst | Out-Null
           $dlls = 'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'cufft64_*.dll'
           foreach ($src in "$env:CUDA_PATH\bin", "$env:CUDA_PATH\lib", "$env:CUDA_PATH\bin\x64") {
-            if (Test-Path $src) {
-              $null = robocopy $src $dst $dlls /NFL /NDL /NJH /NJS
-              # robocopy exit codes 0-7 are success variants; anything >=8 is an
-              # error, except the missing-source-directory case we already guarded.
-            }
+            if (-not (Test-Path $src)) { continue }
+            robocopy $src $dst $dlls /NFL /NDL /NJH /NJS | Out-Null
+            $code = $LASTEXITCODE
+            # 0-7 are robocopy's success variants; >=8 is a genuine failure.
+            if ($code -ge 8) { throw "robocopy failed copying from $src (exit code $code)" }
           }
           if (-not (Get-ChildItem -Path $dst -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) {
             throw "CUDA runtime DLLs were not found under $env:CUDA_PATH"
           }
           Get-ChildItem $dst -Filter *.dll | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+          # Leave a clean exit code behind for the runner.
+          exit 0
 
       - name: Bundle VC runtime
         working-directory: build/cuda${{ matrix.label }}/bin
@@ -607,7 +628,7 @@ jobs:
             throw "No vcruntime140 DLL anywhere under $($redist.FullName); the package would not start on a clean machine"
           }
 
-          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
           if (-not $dumpbin) {
             Write-Host '::warning::dumpbin.exe is not on PATH; skipping import verification'
           } else {
@@ -632,6 +653,58 @@ jobs:
               Where-Object { -not (Test-Path $_) })
             if ($missing.Count -gt 0) {
               throw "Runtime DLLs imported by the binaries are missing from the package: $($missing -join ', ')"
+            }
+          }
+
+      - name: Smoke test binaries
+        working-directory: build/cuda${{ matrix.label }}/bin
+        # Runs AFTER the VC runtime is bundled on purpose: the thin shells need
+        # app-local CRT + ggml-*.dll, and running earlier produced a bare
+        # 0xC0000135 (STATUS_DLL_NOT_FOUND) with no hint about which import was
+        # missing. The CUDA runtime DLLs are staged in build\cudart (they ship as
+        # a separate archive), so that dir is put on PATH for this probe.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cudartDir = Join-Path $env:GITHUB_WORKSPACE 'build\cudart'
+          if (Test-Path $cudartDir) { $env:PATH = "$cudartDir;$env:PATH" }
+
+          function Get-UnresolvedImports {
+            param([string]$ExeName)
+            $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+            if (-not $dumpbin) { return @('<dumpbin.exe not on PATH>') }
+            $inDeps = $false
+            $unresolved = @()
+            foreach ($line in (& $dumpbin /dependents $ExeName 2>$null)) {
+              if ($line -match 'following dependencies') { $inDeps = $true; continue }
+              if (-not $inDeps) { continue }
+              if ($line.Trim() -eq '') { continue }
+              if ($line -notmatch '^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') { $inDeps = $false; continue }
+              $dll = $Matches[1]
+              if (Test-Path $dll) { continue }
+              $onPath = $false
+              foreach ($dir in $env:PATH.Split(';')) {
+                if ($dir -and (Test-Path (Join-Path $dir $dll))) { $onPath = $true; break }
+              }
+              if (-not $onPath) { $unresolved += $dll }
+            }
+            return $unresolved
+          }
+
+          foreach ($name in 'audiocpp_cli.exe', 'audiocpp_server.exe') {
+            if (-not (Test-Path $name)) { throw "Expected binary was not built: $name" }
+            & ".\$name" --version
+            if ($LASTEXITCODE -ne 0) {
+              $hex = '0x{0:X8}' -f ($LASTEXITCODE -band 0xFFFFFFFF)
+              $bad = Get-UnresolvedImports $name
+              throw "$name --version exited with $LASTEXITCODE ($hex); unresolved imports: $($bad -join ', ')"
+            }
+          }
+          if (Test-Path 'audiocpp_gguf.exe') {
+            & .\audiocpp_gguf.exe --help
+            if ($LASTEXITCODE -ne 0) {
+              $hex = '0x{0:X8}' -f ($LASTEXITCODE -band 0xFFFFFFFF)
+              $bad = Get-UnresolvedImports 'audiocpp_gguf.exe'
+              throw "audiocpp_gguf.exe --help exited with $LASTEXITCODE ($hex); unresolved imports: $($bad -join ', ')"
             }
           }
 
