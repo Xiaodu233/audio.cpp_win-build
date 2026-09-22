@@ -90,6 +90,19 @@ env:
   CMAKE_VERSION: '4.4.3'
   NINJA_VERSION: '1.13.2'
   VULKAN_VERSION: '1.4.357.0'
+  # nvcc diagnostic noise level for the CUDA jobs (appended to CMAKE_CUDA_FLAGS).
+  # The vendored ggml CUDA kernels emit these by the thousand and bury the real
+  # errors, so they are suppressed by default:
+  #   177 = variable was declared but never referenced
+  #   550 = variable was set but never used
+  # Tuning options:
+  #   ''                          -> full diagnostics back
+  #   '--diag-suppress=177'       -> only silence the unused-variable one
+  #   '--diag-suppress=177,550'   -> default
+  #   '--brief-diag'              -> drop the source-line echo from every
+  #                                  remaining diagnostic (much shorter log, but
+  #                                  less context when something does break)
+  CUDA_EXTRA_FLAGS: '--diag-suppress=177,550'
 
 concurrency:
   group: release
@@ -279,17 +292,62 @@ jobs:
           $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
             Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
             Select-Object -First 1
+          if (-not $redist) { throw "No MSVC redist directory under $vs\VC\Redist\MSVC" }
           Write-Host "Redist dir: $($redist.FullName)"
-          foreach ($sub in 'x64\Microsoft.VC143.CRT', 'x64\Microsoft.VC143.OPENMP') {
-            $dir = Join-Path $redist.FullName $sub
-            if (Test-Path $dir) {
-              Get-ChildItem "$dir\*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140|vcomp140)' } |
-                Copy-Item -Destination . -Force
-            } else {
-              Write-Host "::warning::Missing redist directory: $dir"
+
+          # x64\Microsoft.VC143.CRT / Microsoft.VC143.OPENMP are the VS 2022
+          # (v143 toolset) names. VS 2026 (MSVC 14.5x) does not use them, which
+          # is exactly why the first run copied nothing and only warned. Do not
+          # hardcode the folder names - search the redist tree for the DLLs and
+          # keep only the x64 copies.
+          $patterns = 'vcruntime140*.dll', 'msvcp140*.dll', 'vcomp140*.dll', 'libomp140*.dll'
+          $found = @()
+          foreach ($p in $patterns) {
+            $found += Get-ChildItem -Path $redist.FullName -Recurse -Filter $p -File -ErrorAction SilentlyContinue
+          }
+          $x64 = @($found | Where-Object { $_.FullName -match '\\x64\\' })
+          if ($x64.Count -gt 0) { $found = $x64 }
+          $seen = @{}
+          foreach ($dll in $found) {
+            if ($seen.ContainsKey($dll.Name)) { continue }
+            $seen[$dll.Name] = $true
+            Copy-Item -LiteralPath $dll.FullName -Destination . -Force
+          }
+          $bundled = @(Get-ChildItem *.dll | Select-Object -ExpandProperty Name | Sort-Object)
+          Write-Host ("bundled: " + ($bundled -join ', '))
+          if (-not ($bundled | Where-Object { $_ -like 'vcruntime140*' })) {
+            throw "No vcruntime140 DLL anywhere under $($redist.FullName); the package would not start on a clean machine"
+          }
+
+          # Cross-check against the real PE imports so a missing runtime can
+          # never be packaged silently again.
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            Write-Host '::warning::dumpbin.exe is not on PATH; skipping import verification'
+          } else {
+            $deps = @{}
+            foreach ($exe in Get-ChildItem -Filter *.exe) {
+              $inDeps = $false
+              foreach ($line in (& $dumpbin /dependents $exe.Name 2>$null)) {
+                if ($line -match 'following dependencies') { $inDeps = $true; continue }
+                if (-not $inDeps) { continue }
+                # dumpbin emits a blank line right after the "following
+                # dependencies" header. Ending the section there would skip
+                # every dependency and silently validate nothing, so blank
+                # lines are skipped and only real text ends the section.
+                if ($line.Trim() -eq '') { continue }
+                if ($line -match '^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') { $deps[$Matches[1]] = $true }
+                else { $inDeps = $false }
+              }
+            }
+            Write-Host ('imports: ' + (($deps.Keys | Sort-Object) -join ', '))
+            $missing = @($deps.Keys |
+              Where-Object { $_ -match '^(vcruntime|msvcp|vcomp|concrt|libomp|msvcr)' } |
+              Where-Object { -not (Test-Path $_) })
+            if ($missing.Count -gt 0) {
+              throw "Runtime DLLs imported by the binaries are missing from the package: $($missing -join ', ')"
             }
           }
-          Get-ChildItem *.dll | Select-Object -ExpandProperty Name
 
       - name: Stage bundle
         working-directory: build/${{ matrix.asset }}/bin
@@ -451,7 +509,7 @@ jobs:
             # "C:\Program Files\Microsoft Visual Studio\..." and gets split the
             # same way. CMake already uses CMAKE_CXX_COMPILER (cl.exe from the
             # msvc-dev-cmd environment) as the nvcc host compiler.
-            '-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8',
+            ('-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 ' + $env:CUDA_EXTRA_FLAGS).Trim(),
             '-DAUDIOCPP_DEPLOYMENT_BUILD=ON',
             '-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON',
             '-DAUDIOCPP_VERSION=${{ needs.get-version.outputs.version }}'
@@ -524,14 +582,58 @@ jobs:
           $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
             Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
             Select-Object -First 1
-          $dir = Join-Path $redist.FullName 'x64\Microsoft.VC143.CRT'
-          if (Test-Path $dir) {
-            Get-ChildItem "$dir\*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } |
-              Copy-Item -Destination . -Force
-          } else {
-            Write-Host "::warning::Missing redist directory: $dir"
+          if (-not $redist) { throw "No MSVC redist directory under $vs\VC\Redist\MSVC" }
+          Write-Host "Redist dir: $($redist.FullName)"
+
+          # Same layout-agnostic search as the CPU/Vulkan job (VS 2026 dropped
+          # the Microsoft.VC143.* folder names). The CUDA configuration disables
+          # OpenMP, so only the /MD CRT is needed.
+          $patterns = 'vcruntime140*.dll', 'msvcp140*.dll'
+          $found = @()
+          foreach ($p in $patterns) {
+            $found += Get-ChildItem -Path $redist.FullName -Recurse -Filter $p -File -ErrorAction SilentlyContinue
           }
-          Get-ChildItem *.dll | Select-Object -ExpandProperty Name
+          $x64 = @($found | Where-Object { $_.FullName -match '\\x64\\' })
+          if ($x64.Count -gt 0) { $found = $x64 }
+          $seen = @{}
+          foreach ($dll in $found) {
+            if ($seen.ContainsKey($dll.Name)) { continue }
+            $seen[$dll.Name] = $true
+            Copy-Item -LiteralPath $dll.FullName -Destination . -Force
+          }
+          $bundled = @(Get-ChildItem *.dll | Where-Object { $_.Name -notlike 'ggml*' } | Select-Object -ExpandProperty Name | Sort-Object)
+          Write-Host ("bundled: " + ($bundled -join ', '))
+          if (-not ($bundled | Where-Object { $_ -like 'vcruntime140*' })) {
+            throw "No vcruntime140 DLL anywhere under $($redist.FullName); the package would not start on a clean machine"
+          }
+
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            Write-Host '::warning::dumpbin.exe is not on PATH; skipping import verification'
+          } else {
+            $deps = @{}
+            foreach ($exe in Get-ChildItem -Filter *.exe) {
+              $inDeps = $false
+              foreach ($line in (& $dumpbin /dependents $exe.Name 2>$null)) {
+                if ($line -match 'following dependencies') { $inDeps = $true; continue }
+                if (-not $inDeps) { continue }
+                # dumpbin emits a blank line right after the "following
+                # dependencies" header. Ending the section there would skip
+                # every dependency and silently validate nothing, so blank
+                # lines are skipped and only real text ends the section.
+                if ($line.Trim() -eq '') { continue }
+                if ($line -match '^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') { $deps[$Matches[1]] = $true }
+                else { $inDeps = $false }
+              }
+            }
+            Write-Host ('imports: ' + (($deps.Keys | Sort-Object) -join ', '))
+            $missing = @($deps.Keys |
+              Where-Object { $_ -match '^(vcruntime|msvcp|vcomp|concrt|libomp|msvcr)' } |
+              Where-Object { -not (Test-Path $_) })
+            if ($missing.Count -gt 0) {
+              throw "Runtime DLLs imported by the binaries are missing from the package: $($missing -join ', ')"
+            }
+          }
 
       - name: Stage bundle
         working-directory: build/cuda${{ matrix.label }}/bin
