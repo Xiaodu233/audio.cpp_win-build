@@ -1479,21 +1479,24 @@ audiocpp_add_model(qwen3_tts
         engine::models::qwen3_tts::make_qwen3_tts_loader
 )
 
-audiocpp_add_model(vietneu_tts
+audiocpp_add_model(vieneu_v3_turbo
     SOURCES
-        src/community_models/vietneu_tts/assets.cpp
-        src/community_models/vietneu_tts/tokenizer_text.cpp
-        src/community_models/vietneu_tts/tokenizer_speech_encoder.cpp
-        src/community_models/vietneu_tts/tokenizer_speech_decoder.cpp
-        src/community_models/vietneu_tts/speaker_encoder.cpp
-        src/community_models/vietneu_tts/talker.cpp
-        src/community_models/vietneu_tts/prompt_tts_voice_clone.cpp
-        src/community_models/vietneu_tts/session.cpp
-        src/community_models/vietneu_tts/loader.cpp
+        src/community_models/vieneu_v3_turbo/assets.cpp
+        src/community_models/vieneu_v3_turbo/tokenizer_text.cpp
+        src/community_models/vieneu_v3_turbo/tokenizer_speech_encoder.cpp
+        src/community_models/vieneu_v3_turbo/tokenizer_speech_decoder.cpp
+        src/community_models/vieneu_v3_turbo/speaker_encoder.cpp
+        src/community_models/vieneu_v3_turbo/talker.cpp
+        src/community_models/vieneu_v3_turbo/prompt_tts_voice_clone.cpp
+        src/community_models/vieneu_v3_turbo/session.cpp
+        src/community_models/vieneu_v3_turbo/loader.cpp
+        src/community_models/vieneu_v3_turbo/frame_cap.cpp
+        src/community_models/vieneu_v3_turbo/orchestration.cpp
+        src/community_models/vieneu_v3_turbo/text_frontend.cpp
     INCLUDES
-        engine/community_models/vietneu_tts/loader.h
+        engine/community_models/vieneu_v3_turbo/loader.h
     LOADERS
-        engine::models::vietneu_tts::make_vietneu_tts_loader
+        engine::models::vieneu_v3_turbo::make_vieneu_v3_turbo_loader
 )
 
 audiocpp_add_model(qwen3_asr
@@ -1590,6 +1593,23 @@ audiocpp_add_model(sortformer_diar_v2
         engine/community_models/sortformer_diar/assets.h
     LOADERS
         engine::community_models::sortformer_diar::make_sortformer_diar_v2_loader
+)
+
+audiocpp_add_model(nemotron_3_diar
+    SOURCES
+        src/models/nemotron_3_diar/assets.cpp
+        src/models/nemotron_3_diar/frontend.cpp
+        src/models/nemotron_3_diar/streaming.cpp
+        src/models/nemotron_3_diar/encoder.cpp
+        src/models/nemotron_3_diar/session.cpp
+    INCLUDES
+        engine/models/nemotron_3_diar/assets.h
+        engine/models/nemotron_3_diar/frontend.h
+        engine/models/nemotron_3_diar/streaming.h
+        engine/models/nemotron_3_diar/encoder.h
+        engine/models/nemotron_3_diar/session.h
+    LOADERS
+        engine::models::nemotron_3_diar::make_nemotron_3_diar_loader
 )
 
 audiocpp_add_model(stable_audio
@@ -2707,7 +2727,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
        glm_tts IN_LIST AUDIOCPP_LINKED_MODELS AND
        niagara_asr IN_LIST AUDIOCPP_LINKED_MODELS AND
        qwen3_tts IN_LIST AUDIOCPP_LINKED_MODELS AND
-       vietneu_tts IN_LIST AUDIOCPP_LINKED_MODELS AND
+       vieneu_v3_turbo IN_LIST AUDIOCPP_LINKED_MODELS AND
        dramabox IN_LIST AUDIOCPP_LINKED_MODELS AND
        mira_tts IN_LIST AUDIOCPP_LINKED_MODELS AND
        chatterbox IN_LIST AUDIOCPP_LINKED_MODELS AND
@@ -2904,6 +2924,9 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         target_link_libraries(kokoro_word_timings_test PRIVATE engine_model_kokoro_tts)
         add_test(NAME kokoro_word_timings_test COMMAND kokoro_word_timings_test)
 
+        add_engine_unittest(quantize_chunking_test tests/unittests/test_quantize_chunking.cpp)
+        add_test(NAME quantize_chunking_test COMMAND quantize_chunking_test)
+
         add_engine_unittest(model_spec_system_test tests/unittests/test_model_spec_system.cpp)
         # So the test can read the specs this repository ships, rather than a
         # copy of them staged somewhere.
@@ -3026,6 +3049,10 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
             target_link_libraries(cli_request_options_test PRIVATE OpenMP::OpenMP_CXX)
         endif()
         add_test(NAME cli_request_options_test COMMAND cli_request_options_test)
+
+        add_engine_unittest(file_sink_json_test tests/unittests/test_file_sink_json.cpp)
+        target_sources(file_sink_json_test PRIVATE app/workflow/file_sink.cpp)
+        add_test(NAME file_sink_json_test COMMAND file_sink_json_test)
 
         add_executable(server_multipart_test
             tests/unittests/test_server_multipart.cpp
@@ -3288,6 +3315,14 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         target_link_libraries(moss_voicegen_codec_encode_parity PRIVATE engine_runtime ggml)
         if (ENGINE_ENABLE_OPENMP)
             target_link_libraries(moss_voicegen_codec_encode_parity PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(moss_codec_decode_length_sweep
+            tests/moss_tts_delay/codec_decode_length_sweep.cpp
+        )
+        target_link_libraries(moss_codec_decode_length_sweep PRIVATE engine_runtime ggml)
+        if (ENGINE_ENABLE_OPENMP)
+            target_link_libraries(moss_codec_decode_length_sweep PRIVATE OpenMP::OpenMP_CXX)
         endif()
 
         add_executable(moss_tts_delay_backbone_parity
