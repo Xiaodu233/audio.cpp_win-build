@@ -95,14 +95,18 @@ env:
   # errors, so they are suppressed by default:
   #   177 = variable was declared but never referenced
   #   550 = variable was set but never used
+  #   221 = floating-point value does not fit in required floating-point type
+  #         (ggml CUDA kernels assign -INFINITY/1e30 to __half/__nv_bfloat16
+  #         literals; harmless on every supported arch, and CUDA 12.x emits it
+  #         by the thousand while 13.x does not)
   # Tuning options:
-  #   ''                          -> full diagnostics back
-  #   '--diag-suppress=177'       -> only silence the unused-variable one
-  #   '--diag-suppress=177,550'   -> default
+  #   ''                              -> full diagnostics back
+  #   '--diag-suppress=177'           -> only silence the unused-variable one
+  #   '--diag-suppress=177,550,221'   -> default
   #   '--brief-diag'              -> drop the source-line echo from every
   #                                  remaining diagnostic (much shorter log, but
   #                                  less context when something does break)
-  CUDA_EXTRA_FLAGS: '--diag-suppress=177,550'
+  CUDA_EXTRA_FLAGS: '--diag-suppress=177,550,221'
 
 concurrency:
   group: release
@@ -381,9 +385,23 @@ jobs:
         working-directory: build/${{ matrix.asset }}/bin
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item ..\..\..\LICENSE . -Force
-          if (Test-Path ..\..\..\tools)       { Copy-Item -Recurse ..\..\..\tools       .\tools -Force }
-          if (Test-Path ..\..\..\model_specs) { Copy-Item -Recurse ..\..\..\model_specs .\model_specs -Force }
+          # Resolve the repo root through GITHUB_WORKSPACE instead of counting
+          # ".." levels - the depth of the bin dir differs between jobs and a
+          # miscount silently tries to copy build\LICENSE.
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Resolve-Path '..\..\..').Path }
+          Write-Host "repo root: $root"
+          $license = Join-Path $root 'LICENSE'
+          if (-not (Test-Path -LiteralPath $license)) { throw "LICENSE not found at $license" }
+          Copy-Item -LiteralPath $license -Destination . -Force
+          foreach ($dir in 'tools', 'model_specs') {
+            $src = Join-Path $root $dir
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -Recurse -LiteralPath $src -Destination (Join-Path (Get-Location) $dir) -Force
+            } else {
+              Write-Host "::warning::$src not present in the checkout; skipping"
+            }
+          }
           # Inventory goes to the job summary so the packaged dependency set can
           # be checked without downloading the zip.
           $entries = Get-ChildItem -Force | Sort-Object Name
@@ -712,9 +730,23 @@ jobs:
         working-directory: build/cuda${{ matrix.label }}/bin
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item ..\..\LICENSE . -Force
-          if (Test-Path ..\..\tools)       { Copy-Item -Recurse ..\..\tools       .\tools -Force }
-          if (Test-Path ..\..\model_specs) { Copy-Item -Recurse ..\..\model_specs .\model_specs -Force }
+          # Same GITHUB_WORKSPACE-based resolution as the CPU/Vulkan job (the
+          # bin dir sits one level deeper than build\<asset>\bin was assumed to
+          # be, so a relative ..\..\LICENSE resolved to build\LICENSE).
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Resolve-Path '..\..\..').Path }
+          Write-Host "repo root: $root"
+          $license = Join-Path $root 'LICENSE'
+          if (-not (Test-Path -LiteralPath $license)) { throw "LICENSE not found at $license" }
+          Copy-Item -LiteralPath $license -Destination . -Force
+          foreach ($dir in 'tools', 'model_specs') {
+            $src = Join-Path $root $dir
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -Recurse -LiteralPath $src -Destination (Join-Path (Get-Location) $dir) -Force
+            } else {
+              Write-Host "::warning::$src not present in the checkout; skipping"
+            }
+          }
           # Inventory goes to the job summary so the packaged dependency set can
           # be checked without downloading the zip. ggml-*.dll must be here:
           # CPU_ALL_VARIANTS makes the backends shared libraries.
